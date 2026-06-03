@@ -20,8 +20,15 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
 def get_ai_client(model: str, max_retries=2) -> openai.OpenAI:
     if model.startswith("ollama/"):
         client = openai.OpenAI(
-            base_url="http://localhost:11434/v1", 
+            base_url="http://localhost:11434/v1",
             max_retries=max_retries
+        )
+    elif "gemini" in model:
+        import os
+        client = openai.OpenAI(
+            api_key=os.environ["GEMINI_API_KEY"],
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            max_retries=max_retries,
         )
     else:
         client = openai.OpenAI(max_retries=max_retries)
@@ -36,6 +43,14 @@ def query(
 ) -> tuple[OutputType, float, int, int, dict]:
     client = get_ai_client(model_kwargs.get("model"), max_retries=0)
     filtered_kwargs: dict = select_values(notnone, model_kwargs)  # type: ignore
+
+    # Gemini's OpenAI-compatible endpoint rejects requests with a system
+    # message but no user message (HTTP 400, "contents is not specified").
+    # Promote the system text into a user message in that case.
+    if "gemini" in (model_kwargs.get("model") or "") and not user_message:
+        if system_message:
+            user_message = system_message
+            system_message = None
 
     messages = opt_messages_to_list(system_message, user_message)
 

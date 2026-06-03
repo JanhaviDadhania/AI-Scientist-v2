@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 from typing import Any
 from ai_scientist.utils.token_tracker import track_token_usage
 
@@ -10,7 +11,57 @@ import openai
 
 MAX_NUM_TOKENS = 4096
 
+# Sentinel client object for the local Claude Code CLI backend. The CLI does not
+# need a connection object, but the rest of the code expects `create_client` to
+# return something truthy and `get_response_from_llm` to receive a `client`.
+class _ClaudeCLIClient:
+    """Marker client. Calls go through `subprocess` against `claude -p`."""
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "<ClaudeCLIClient>"
+
+
+CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
+
+
+def _call_claude_cli(system_message: str, msg_history: list[dict[str, Any]]) -> str:
+    """Run the local `claude -p` CLI and return its stdout as the assistant reply.
+
+    msg_history is a list of {"role", "content"} dicts. We flatten it into a
+    single prompt because `claude -p` is a one-shot non-interactive call.
+    """
+    parts: list[str] = []
+    if system_message:
+        parts.append(f"[SYSTEM]\n{system_message}\n")
+    for m in msg_history:
+        role = m.get("role", "user").upper()
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # anthropic-style content blocks
+            content = "\n".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+            )
+        parts.append(f"[{role}]\n{content}\n")
+    parts.append("[ASSISTANT]\n")
+    prompt = "\n".join(parts)
+
+    result = subprocess.run(
+        ["claude", "-p"],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude -p failed (rc={result.returncode}): {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
 AVAILABLE_LLMS = [
+    "claude-cli",
+    "claude-code",
     "claude-3-5-sonnet-20240620",
     "claude-3-5-sonnet-20241022",
     # OpenAI models
@@ -98,7 +149,16 @@ def get_batch_responses_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if model.startswith("ollama/"):
+    if model in CLAUDE_CLI_MODEL_NAMES:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        content = []
+        for _ in range(n_responses):
+            c = _call_claude_cli(system_message, new_msg_history)
+            content.append(c)
+        new_msg_history = [
+            new_msg_history + [{"role": "assistant", "content": c}] for c in content
+        ]
+    elif model.startswith("ollama/"):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
             model=model.replace("ollama/", ""),
@@ -277,7 +337,13 @@ def get_response_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if "claude" in model:
+    if model in CLAUDE_CLI_MODEL_NAMES:
+        new_msg_history = msg_history + [{"role": "user", "content": msg}]
+        content = _call_claude_cli(system_message, new_msg_history)
+        new_msg_history = new_msg_history + [
+            {"role": "assistant", "content": content}
+        ]
+    elif "claude" in model:
         new_msg_history = msg_history + [
             {
                 "role": "user",
@@ -478,6 +544,9 @@ def extract_json_between_markers(llm_output: str) -> dict | None:
 
 
 def create_client(model) -> tuple[Any, str]:
+    if model in CLAUDE_CLI_MODEL_NAMES:
+        print(f"Using local Claude CLI (`claude -p`) for model {model}.")
+        return _ClaudeCLIClient(), model
     if model.startswith("claude-"):
         print(f"Using Anthropic API with model {model}.")
         return anthropic.Anthropic(), model

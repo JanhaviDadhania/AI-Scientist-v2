@@ -16,6 +16,10 @@ AVAILABLE_VLMS = [
     "gpt-4o-2024-11-20",
     "gpt-4o-mini-2024-07-18",
     "o3-mini",
+    # Google Gemini (vision) via OpenAI-compatible endpoint
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-pro-preview-03-25",
 
     # Ollama models
 
@@ -64,7 +68,7 @@ def make_llm_call(client, model, temperature, system_message, prompt):
             stop=None,
             seed=0,
         )
-    elif "gpt" in model:
+    elif "gpt" in model or "gemini" in model:
         return client.chat.completions.create(
             model=model,
             messages=[
@@ -104,7 +108,7 @@ def make_vlm_call(client, model, temperature, system_message, prompt):
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
         )
-    elif "gpt" in model:
+    elif "gpt" in model or "gemini" in model:
         return client.chat.completions.create(
             model=model,
             messages=[
@@ -203,6 +207,15 @@ def create_client(model: str) -> tuple[Any, str]:
     ]:
         print(f"Using OpenAI API with model {model}.")
         return openai.OpenAI(), model
+    elif "gemini" in model:
+        print(f"Using Gemini (OpenAI-compatible) API with model {model}.")
+        return (
+            openai.OpenAI(
+                api_key=os.environ["GEMINI_API_KEY"],
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            ),
+            model,
+        )
     elif model.startswith("ollama/"):
         print(f"Using Ollama API with model {model}.")
         return openai.OpenAI(

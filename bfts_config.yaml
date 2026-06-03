@@ -23,7 +23,7 @@ exec:
 generate_report: True
 # LLM settings for final report from journal
 report:
-  model: gpt-4o-2024-11-20
+  model: claude-cli
   temp: 1.0
 
 experiment:
@@ -35,18 +35,18 @@ debug:
 # agent hyperparams
 agent:
   type: parallel
-  num_workers: 4
+  num_workers: 1
   stages:
-    stage1_max_iters: 20
-    stage2_max_iters: 12
-    stage3_max_iters: 12
-    stage4_max_iters: 18
+    stage1_max_iters: 2
+    stage2_max_iters: 2
+    stage3_max_iters: 2
+    stage4_max_iters: 2
   # how many improvement iterations to run
-  steps: 5 # if stage-specific max_iters are not provided, the agent will use this value for all stages
+  steps: 2 # if stage-specific max_iters are not provided, the agent will use this value for all stages
   # whether to instruct the agent to use CV (set to 1 to disable)
   k_fold_validation: 1
   multi_seed_eval:
-    num_seeds: 3 # should be the same as num_workers if num_workers < 3. Otherwise, set it to be 3.
+    num_seeds: 1 # should be the same as num_workers if num_workers < 3. Otherwise, set it to be 3.
   # whether to instruct the agent to generate a prediction function
   expose_prediction: False
   # whether to provide the agent with a preview of the data
@@ -54,34 +54,33 @@ agent:
 
   # LLM settings for coding
   code:
-    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    model: claude-cli
     temp: 1.0
     max_tokens: 12000
 
-  # LLM settings for evaluating program output / tracebacks
+  # LLM settings for evaluating program output / tracebacks.
+  # This path uses function calling (structured tool output), which the
+  # `claude -p` CLI doesn't expose, so it must be a tools-capable model.
   feedback:
-    model: gpt-4o-2024-11-20
-    # gpt-4o
+    model: gemini-2.5-flash-lite
     temp: 0.5
     max_tokens: 8192
 
   vlm_feedback:
-    model: gpt-4o-2024-11-20
+    model: gemini-2.5-flash-lite
     temp: 0.5
     max_tokens: null
 
   search:
-    max_debug_depth: 3
+    max_debug_depth: 1
     debug_prob: 0.5
-    num_drafts: 3
+    num_drafts: 1
 
-  # Options for summarizing findings and selecting the best node
-  # If not specified, the default behavior will be used.
+  # Options for summarizing findings and selecting the best node.
+  summary:
+    model: claude-cli
+    temp: 0.3
 
-  # summary:
-  #   model: gpt-4o
-  #   temp: 0.3
-
-  # select_node:
-  #   model: gpt-4o
-  #   temp: 0.3
+  select_node:
+    model: claude-cli
+    temp: 0.3
