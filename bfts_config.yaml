@@ -37,12 +37,12 @@ agent:
   type: parallel
   num_workers: 1
   stages:
-    stage1_max_iters: 2
-    stage2_max_iters: 2
-    stage3_max_iters: 2
-    stage4_max_iters: 2
+    stage1_max_iters: 5
+    stage2_max_iters: 3
+    stage3_max_iters: 3
+    stage4_max_iters: 3
   # how many improvement iterations to run
-  steps: 2 # if stage-specific max_iters are not provided, the agent will use this value for all stages
+  steps: 3 # if stage-specific max_iters are not provided, the agent will use this value for all stages
   # whether to instruct the agent to use CV (set to 1 to disable)
   k_fold_validation: 1
   multi_seed_eval:
@@ -59,10 +59,10 @@ agent:
     max_tokens: 12000
 
   # LLM settings for evaluating program output / tracebacks.
-  # This path uses function calling (structured tool output), which the
-  # `claude -p` CLI doesn't expose, so it must be a tools-capable model.
+  # Routes through backend_claude_cli's structured-output path
+  # (`claude -p --json-schema ... --output-format json`).
   feedback:
-    model: gemini-2.5-flash-lite
+    model: claude-cli
     temp: 0.5
     max_tokens: 8192
 
