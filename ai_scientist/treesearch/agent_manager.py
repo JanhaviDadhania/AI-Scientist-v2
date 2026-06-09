@@ -348,14 +348,11 @@ Your research idea:\n\n
         if not best_node:
             return False, "No best node found"
 
-        vlm_feedback = self._parse_vlm_feedback(best_node)
-
-        # PATCHED 2026-06-09 (B): include the measured metrics as evidence too,
-        # not just the VLM's plot description. The original eval only fed the
-        # decision-LLM "figure analysis"; if the plotting step didn't run, the
-        # decision-LLM had no evidence at all and always said "not complete",
-        # blocking stage progression even when experiments were producing
-        # valid metrics.
+        # PATCHED 2026-06-09 (B + no-VLM): judge completion by measured metrics
+        # and plot-artifact existence only. VLM (vision) inspection of plots is
+        # intentionally skipped on this setup, so the prompt does NOT include
+        # any "Figure Analysis" section — the decision-LLM should not wait for
+        # something that won't be produced.
         metric_summary_lines: list[str] = []
         try:
             mv = best_node.metric.value if hasattr(best_node, "metric") else None
@@ -379,11 +376,21 @@ Your research idea:\n\n
             else "(no structured metrics extracted)"
         )
 
+        # Plot artifact summary: counts + a sample of filenames so the
+        # decision-LLM can confirm the experiment script produced figures.
+        import os as _os
+        plot_paths = list(getattr(best_node, "plot_paths", []) or [])
+        plot_sample = [_os.path.basename(p) for p in plot_paths[:8]]
+        plot_evidence = f"{len(plot_paths)} plot file(s) generated on disk"
+        if plot_sample:
+            plot_evidence += " (e.g. " + ", ".join(plot_sample) + ")"
+        plot_evidence += "."
+
         eval_prompt = f"""
         Evaluate if the current sub-stage is complete based on the following evidence:
 
-        1. Figure Analysis:
-        {vlm_feedback}
+        1. Plot artifacts produced by the best node's experiment:
+        {plot_evidence}
 
         2. Measured metrics from the best node's execution:
         {metric_section}
@@ -391,9 +398,12 @@ Your research idea:\n\n
         Requirements for completion:
         - {current_substage.goals}
 
-        Note: a sub-stage may be complete even when figure analysis is sparse
-        or missing, if the measured metrics clearly satisfy the requirements.
-        Weigh the metrics evidence on its own merits.
+        Important: Visual inspection of plot images is intentionally NOT part
+        of this evaluation. Do not require any "figure analysis" or visual
+        commentary to declare completion. Judge completion strictly by:
+        (a) whether the measured metrics meaningfully satisfy the sub-stage
+            goals, and
+        (b) whether plot artifacts were produced (counts and filenames above).
 
         Provide a detailed evaluation of completion status.
         """
