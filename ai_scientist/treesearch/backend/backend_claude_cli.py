@@ -3,16 +3,31 @@
 Used when the configured model name is `claude-cli` or `claude-code`. Mirrors
 the signature of the other treesearch backends so it plugs into `backend/__init__.py`.
 
-Function-calling (structured tool output) is supported via the CLI's built-in
-`--json-schema` / `--output-format json` flags, which return a JSON envelope
-with a `structured_output` field that conforms to the requested schema. This
-removes the need to route func-call traffic through Gemini.
+PATCHED 2026-06-09 (Option 2 — strict-prompt structured output):
+  - Drop the broken `claude -p --json-schema X --output-format json` path.
+    That envelope intermittently omits `structured_output` and the model's
+    JSON ends up wrapped in chat-form `result` text — which then either
+    cascades into is_buggy=True via the upstream wrapper at
+    parallel_agent.py:1654, or KeyError's downstream because the chat-form
+    JSON shape doesn't match the wrapper's expectations.
+  - Instead: call `claude -p` plain, with a strict prompt header that tells
+    the model to output EXACTLY one JSON object matching the schema and
+    nothing else. Parse stdout directly with json.loads. Tested 12/12 on
+    review / parse-metrics / nested-adversarial schemas (test_strict_json.py).
+  - The old regex fallback is retained as `_extract_json_from_chat` for use
+    as a deep last-resort if json.loads itself fails (e.g. claude adds a
+    fenced block despite instructions).
+  - Per-call disk logging via env var CLAUDE_CALL_LOG_DIR is preserved.
+    Nothing the paid LLM produces should be lost.
 """
 
 import json
 import logging
+import os
+import re
 import subprocess
 import time
+import uuid
 from typing import Any
 
 from .utils import FunctionSpec, OutputType
@@ -22,26 +37,92 @@ logger = logging.getLogger("ai-scientist.claude_cli")
 
 CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
 
+_LOG_SEQ = 0
 
-def _flatten_prompt(system_message: str | None, user_message: str | None) -> str:
+
+def _maybe_log_call(kind: str, stdin: str, stdout: str, stderr: str, returncode: int, args: list[str]) -> None:
+    """If CLAUDE_CALL_LOG_DIR is set, persist this call's IO to disk."""
+    log_dir = os.environ.get("CLAUDE_CALL_LOG_DIR")
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        global _LOG_SEQ
+        _LOG_SEQ += 1
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        tag = f"{ts}_pid{os.getpid()}_seq{_LOG_SEQ:05d}_{kind}_{uuid.uuid4().hex[:6]}"
+        with open(os.path.join(log_dir, f"{tag}_input.txt"), "w", encoding="utf-8") as f:
+            f.write(f"# argv: {args}\n# kind: {kind}\n# returncode: {returncode}\n---\n")
+            f.write(stdin)
+        with open(os.path.join(log_dir, f"{tag}_output.txt"), "w", encoding="utf-8") as f:
+            f.write(f"# returncode: {returncode}\n# stderr:\n{stderr}\n---stdout---\n")
+            f.write(stdout)
+    except Exception as e:
+        logger.warning(f"failed to log claude -p call: {e}")
+
+
+def _extract_json_from_chat(text: str) -> dict:
+    """Deep last-resort: extract JSON from chat-style text using fence or brace
+    scan. Used only when the strict prompt failed to elicit clean JSON."""
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    depth = 0
+    start = None
+    for i, c in enumerate(text):
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    start = None
+                    depth = 0
+    raise RuntimeError(
+        f"no JSON object extractable from chat text; first 500 chars: {text[:500]}"
+    )
+
+
+def _flatten_prompt(system_message: Any, user_message: Any) -> str:
     parts: list[str] = []
-    if system_message:
+    if isinstance(system_message, dict):
+        sub = []
+        for k, v in system_message.items():
+            sub.append(f"## {k}\n{v}\n")
+        sys_text = "\n".join(sub)
+        parts.append(f"[SYSTEM]\n{sys_text}\n")
+    elif system_message:
         parts.append(f"[SYSTEM]\n{system_message}\n")
     if user_message:
+        if isinstance(user_message, dict):
+            sub_parts = []
+            for k, v in user_message.items():
+                sub_parts.append(f"## {k}\n{v}\n")
+            user_message = "\n".join(sub_parts)
         parts.append(f"[USER]\n{user_message}\n")
     parts.append("[ASSISTANT]\n")
     return "\n".join(parts)
 
 
-def _call_claude_cli(system_message: str | None, user_message: str | None) -> str:
+def _call_claude_cli(system_message: Any, user_message: Any) -> str:
     """Plain text out — used when no function-calling is requested."""
+    args = ["claude", "-p"]
+    stdin = _flatten_prompt(system_message, user_message)
     result = subprocess.run(
-        ["claude", "-p"],
-        input=_flatten_prompt(system_message, user_message),
+        args,
+        input=stdin,
         capture_output=True,
         text=True,
         timeout=900,
     )
+    _maybe_log_call("plain", stdin, result.stdout, result.stderr, result.returncode, args)
     if result.returncode != 0:
         raise RuntimeError(
             f"claude -p failed (rc={result.returncode}): {result.stderr.strip()}"
@@ -49,69 +130,110 @@ def _call_claude_cli(system_message: str | None, user_message: str | None) -> st
     return result.stdout.strip()
 
 
+# ─── Option 2 strict-output prompt header ──────────────────────────────────
+# Drop the --json-schema flag entirely. Instead, prepend this header so the
+# model knows it must emit one JSON object and nothing else. Tested 12/12 on
+# the review/parse_metrics/adversarial schemas. Note: this string contains
+# literal `{` and `}` in the rules text, so it must NOT be passed through
+# str.format() — the tool name/purpose line is composed separately below.
+STRICT_RULES = """You must respond with EXACTLY one JSON object that matches the schema below, and ABSOLUTELY NOTHING else.
+
+Hard rules:
+- No prose before or after the JSON.
+- No markdown code fences. No backticks.
+- No commentary, no explanation, no preamble like "Here's the JSON:".
+- Begin your response with `{` and end with `}`.
+- The result must be valid JSON, parseable by Python's `json.loads()`.
+
+"""
+
+
+def _strip_common_wrappers(text: str) -> str:
+    """Minimal cleanup if the model defied the strict instruction. Strips
+    surrounding whitespace, a single ``` fence pair, a leading 'json' tag,
+    and leading/trailing prose lines that don't start with '{' or end with '}'."""
+    t = text.strip()
+    # Strip a single ``` fence pair if present
+    if t.startswith("```"):
+        # Drop the opening line (which may say ```json)
+        if "\n" in t:
+            t = t.split("\n", 1)[1]
+        # Drop the closing fence
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[: -len("```")].rstrip()
+    # Drop a leading 'json' tag on its own line
+    if t.lower().startswith("json\n"):
+        t = t[5:].strip()
+    return t.strip()
+
+
 def _call_claude_cli_structured(
-    system_message: str | None,
-    user_message: str | None,
+    system_message: Any,
+    user_message: Any,
     func_spec: FunctionSpec,
 ) -> dict[str, Any]:
-    """Structured output via `claude -p --json-schema ... --output-format json`.
-
-    Returns the dict that conforms to `func_spec.json_schema`.
+    """Structured output via strict-prompt (Option 2). Calls `claude -p` with
+    no `--json-schema` flag and parses stdout directly. Falls back to a
+    chat-text extractor only if json.loads can't recover even after cleanup.
     """
-    schema_str = json.dumps(func_spec.json_schema)
-    # Help the model by mentioning the function's purpose in the prompt, since
-    # `--json-schema` itself only specifies shape, not intent.
-    intent_hint = (
-        f"\n\n[TASK]\nProduce structured output for the tool `{func_spec.name}`. "
-        f"Purpose: {func_spec.description.strip()}\n"
+    schema_str = json.dumps(func_spec.json_schema, indent=2)
+    # Compose the prompt header WITHOUT using str.format() — the rules text
+    # contains literal `{` and `}` which would break .format() (this was the
+    # KeyError we hit on first run). Tool name / purpose are appended via
+    # plain concatenation instead.
+    schema_line = (
+        "SCHEMA (for tool `" + func_spec.name + "` — "
+        + func_spec.description.strip() + "):\n"
     )
-    prompt = _flatten_prompt(system_message, (user_message or "") + intent_hint)
+    body = _flatten_prompt(system_message, user_message)
+    stdin = STRICT_RULES + schema_line + schema_str + "\n\n---\n\n" + body
 
+    args = ["claude", "-p"]
     result = subprocess.run(
-        [
-            "claude",
-            "-p",
-            "--json-schema",
-            schema_str,
-            "--output-format",
-            "json",
-        ],
-        input=prompt,
+        args,
+        input=stdin,
         capture_output=True,
         text=True,
         timeout=900,
     )
+    _maybe_log_call("structured-strict", stdin, result.stdout, result.stderr, result.returncode, args)
+
     if result.returncode != 0:
         raise RuntimeError(
-            f"claude -p (structured) failed (rc={result.returncode}): "
+            f"claude -p (strict) failed (rc={result.returncode}): "
             f"{result.stderr.strip()[:500]}"
         )
 
+    raw = result.stdout.strip()
+
+    # Try direct parse
     try:
-        envelope = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"claude -p returned non-JSON envelope: {e}; first 500 chars: "
-            f"{result.stdout[:500]}"
-        )
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
 
-    if envelope.get("is_error"):
-        raise RuntimeError(
-            f"claude -p reported error: {envelope.get('result', '(no detail)')[:500]}"
-        )
+    # Light cleanup (strip a stray fence or 'json' tag)
+    cleaned = _strip_common_wrappers(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
 
-    structured = envelope.get("structured_output")
-    if structured is None:
+    # Deep fallback: extract a JSON object from chat-style text
+    try:
+        extracted = _extract_json_from_chat(raw)
+        logger.info("strict-prompt parse failed; deep fallback succeeded")
+        return extracted
+    except RuntimeError as e:
         raise RuntimeError(
-            "claude -p envelope missing `structured_output`; "
-            f"result field: {str(envelope.get('result'))[:500]}"
+            f"strict-prompt + cleanup + chat-extract all failed for tool "
+            f"`{func_spec.name}`. Raw response (first 500 chars): {raw[:500]}"
         )
-    return structured
 
 
 def query(
-    system_message: str | None,
-    user_message: str | None,
+    system_message: Any,
+    user_message: Any,
     func_spec: FunctionSpec | None = None,
     **model_kwargs: Any,
 ) -> tuple[OutputType, float, int, int, dict]:
@@ -122,9 +244,7 @@ def query(
         output = _call_claude_cli_structured(system_message, user_message, func_spec)
     req_time = time.time() - t0
 
-    # The CLI doesn't expose token counts in plain-text mode; estimate roughly so
-    # the rest of the pipeline (cost/latency tracking) doesn't blow up.
-    in_tokens = (len(system_message or "") + len(user_message or "")) // 4
+    in_tokens = (len(str(system_message) if system_message else "") + len(str(user_message) if user_message else "")) // 4
     out_tokens = (
         len(output) // 4
         if isinstance(output, str)

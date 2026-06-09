@@ -349,13 +349,51 @@ Your research idea:\n\n
             return False, "No best node found"
 
         vlm_feedback = self._parse_vlm_feedback(best_node)
+
+        # PATCHED 2026-06-09 (B): include the measured metrics as evidence too,
+        # not just the VLM's plot description. The original eval only fed the
+        # decision-LLM "figure analysis"; if the plotting step didn't run, the
+        # decision-LLM had no evidence at all and always said "not complete",
+        # blocking stage progression even when experiments were producing
+        # valid metrics.
+        metric_summary_lines: list[str] = []
+        try:
+            mv = best_node.metric.value if hasattr(best_node, "metric") else None
+            if isinstance(mv, dict) and isinstance(mv.get("metric_names"), list):
+                for mn in mv["metric_names"]:
+                    name = mn.get("metric_name", "?")
+                    desc = mn.get("description", "")
+                    lib = mn.get("lower_is_better")
+                    direction = "lower=better" if lib else ("higher=better" if lib is False else "")
+                    metric_summary_lines.append(f"- {name} ({direction}): {desc}")
+                    for d in mn.get("data", []) or []:
+                        ds = d.get("dataset_name", "")
+                        final_v = d.get("final_value")
+                        best_v = d.get("best_value")
+                        metric_summary_lines.append(f"    {ds}: final={final_v}, best={best_v}")
+        except Exception:
+            pass
+        metric_section = (
+            "\n".join(metric_summary_lines)
+            if metric_summary_lines
+            else "(no structured metrics extracted)"
+        )
+
         eval_prompt = f"""
         Evaluate if the current sub-stage is complete based on the following evidence:
+
         1. Figure Analysis:
         {vlm_feedback}
 
+        2. Measured metrics from the best node's execution:
+        {metric_section}
+
         Requirements for completion:
         - {current_substage.goals}
+
+        Note: a sub-stage may be complete even when figure analysis is sparse
+        or missing, if the measured metrics clearly satisfy the requirements.
+        Weigh the metrics evidence on its own merits.
 
         Provide a detailed evaluation of completion status.
         """

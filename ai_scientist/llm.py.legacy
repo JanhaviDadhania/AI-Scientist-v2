@@ -24,32 +24,6 @@ class _ClaudeCLIClient:
 CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
 
 
-_LLM_LOG_SEQ = 0
-
-
-def _maybe_log_llm_call(stdin: str, stdout: str, stderr: str, returncode: int) -> None:
-    """If CLAUDE_CALL_LOG_DIR is set, persist this call's IO to disk.
-    PATCHED 2026-06-08: nothing the paid LLM produces should be lost."""
-    import os, time, uuid
-    log_dir = os.environ.get("CLAUDE_CALL_LOG_DIR")
-    if not log_dir:
-        return
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        global _LLM_LOG_SEQ
-        _LLM_LOG_SEQ += 1
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        tag = f"{ts}_pid{os.getpid()}_seq{_LLM_LOG_SEQ:05d}_writeup_{uuid.uuid4().hex[:6]}"
-        with open(os.path.join(log_dir, f"{tag}_input.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# kind: writeup-plain\n# returncode: {returncode}\n---\n")
-            f.write(stdin)
-        with open(os.path.join(log_dir, f"{tag}_output.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# returncode: {returncode}\n# stderr:\n{stderr}\n---stdout---\n")
-            f.write(stdout)
-    except Exception:
-        pass  # logging must never crash the run
-
-
 def _call_claude_cli(system_message: str, msg_history: list[dict[str, Any]]) -> str:
     """Run the local `claude -p` CLI and return its stdout as the assistant reply.
 
@@ -78,7 +52,6 @@ def _call_claude_cli(system_message: str, msg_history: list[dict[str, Any]]) -> 
         text=True,
         timeout=600,
     )
-    _maybe_log_llm_call(prompt, result.stdout, result.stderr, result.returncode)
     if result.returncode != 0:
         raise RuntimeError(
             f"claude -p failed (rc={result.returncode}): {result.stderr.strip()}"

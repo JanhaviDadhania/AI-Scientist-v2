@@ -356,7 +356,13 @@ def overall_summarize(journals, cfg=None):
                 total=len(list(journals)),
             )
         )
-        draft_summary, baseline_summary, research_summary, ablation_summary = results
+        # PATCHED 2026-06-09: tolerate partial stages. BFTS may have only run
+        # stage 1 if subsequent stages were never triggered. The downstream
+        # writeup code can handle None for missing summaries; the original
+        # hardcoded 4-tuple unpack cannot.
+        while len(results) < 4:
+            results.append(None)
+        draft_summary, baseline_summary, research_summary, ablation_summary = results[:4]
 
     return draft_summary, baseline_summary, research_summary, ablation_summary
 

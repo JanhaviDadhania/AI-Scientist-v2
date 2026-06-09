@@ -720,6 +720,11 @@ def filter_experiment_summaries(exp_summaries, step_name):
 
     filtered_summaries = {}
     for stage_name in exp_summaries.keys():
+        # PATCHED 2026-06-09: skip stages that never ran (None summary). The
+        # upstream overall_summarize now pads missing stages with None so the
+        # 4-tuple unpack survives; downstream code must also tolerate that.
+        if exp_summaries[stage_name] is None:
+            continue
         if stage_name in {"BASELINE_SUMMARY", "RESEARCH_SUMMARY"}:
             filtered_summaries[stage_name] = {}
             for key in exp_summaries[stage_name].keys():
