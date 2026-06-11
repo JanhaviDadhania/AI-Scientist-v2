@@ -59,15 +59,18 @@ agent:
     max_tokens: 12000
 
   # LLM settings for evaluating program output / tracebacks.
-  # Routes through backend_claude_cli's structured-output path
-  # (`claude -p --json-schema ... --output-format json`).
+  # Routes through backend_claude_cli's strict-prompt structured output:
+  # the JSON schema is embedded in the prompt and the reply is parsed
+  # from stdout with json.loads (no --json-schema flag).
   feedback:
     model: claude-cli
     temp: 0.5
     max_tokens: 8192
 
+  # Vision feedback on plots. claude-cli is multimodal: the backend writes
+  # image blocks to disk and `claude -p` Reads the files itself.
   vlm_feedback:
-    model: gemini-2.5-flash-lite
+    model: claude-cli
     temp: 0.5
     max_tokens: null
 
