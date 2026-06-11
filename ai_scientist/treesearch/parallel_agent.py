@@ -1770,23 +1770,15 @@ class ParallelAgent:
                     )
 
                 if child_node.plots:
-                    # PATCHED 2026-06-09: skip the VLM (gemini) plot analysis.
-                    # We don't have GEMINI_API_KEY on this setup and explicitly
-                    # don't want to pay for vision-model evaluation. Substage
-                    # completion is judged on metrics + plot-artifact existence
-                    # via _check_substage_completion; the actual visual content
-                    # of plots isn't fed to any LLM.
-                    child_node.is_buggy_plots = False
-                    child_node.plot_analyses = []
-                    child_node.vlm_feedback_summary = (
-                        f"VLM analysis intentionally skipped. "
-                        f"{len(child_node.plot_paths)} plot artifacts generated and "
-                        f"saved to disk."
-                    )
-                    logger.info(
-                        f"VLM analysis skipped for node {child_node.id} "
-                        f"({len(child_node.plot_paths)} plot artifacts present)"
-                    )
+                    try:
+                        worker_agent._analyze_plots_with_vlm(child_node)
+                        logger.info(
+                            f"Generated VLM analysis for plots in node {child_node.id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Error analyzing plots for node {child_node.id}: {str(e)}"
+                        )
 
             # Convert result node to dict
             print("Converting result to dict")
