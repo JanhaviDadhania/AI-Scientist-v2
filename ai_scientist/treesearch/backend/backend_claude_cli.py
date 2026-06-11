@@ -26,12 +26,11 @@ import json
 import logging
 import os
 import re
-import subprocess
 import tempfile
 import time
-import uuid
 from typing import Any
 
+from ...claude_cli_util import is_claude_cli, run_claude
 from .utils import FunctionSpec, OutputType
 
 
@@ -39,54 +38,31 @@ logger = logging.getLogger("ai-scientist.claude_cli")
 
 CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
 
-_LOG_SEQ = 0
-
-
-def _maybe_log_call(kind: str, stdin: str, stdout: str, stderr: str, returncode: int, args: list[str]) -> None:
-    """If CLAUDE_CALL_LOG_DIR is set, persist this call's IO to disk."""
-    log_dir = os.environ.get("CLAUDE_CALL_LOG_DIR")
-    if not log_dir:
-        return
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        global _LOG_SEQ
-        _LOG_SEQ += 1
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        tag = f"{ts}_pid{os.getpid()}_seq{_LOG_SEQ:05d}_{kind}_{uuid.uuid4().hex[:6]}"
-        with open(os.path.join(log_dir, f"{tag}_input.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# argv: {args}\n# kind: {kind}\n# returncode: {returncode}\n---\n")
-            f.write(stdin)
-        with open(os.path.join(log_dir, f"{tag}_output.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# returncode: {returncode}\n# stderr:\n{stderr}\n---stdout---\n")
-            f.write(stdout)
-    except Exception as e:
-        logger.warning(f"failed to log claude -p call: {e}")
+_WARNED_IGNORED_KWARGS = False
 
 
 def _extract_json_from_chat(text: str) -> dict:
-    """Deep last-resort: extract JSON from chat-style text using fence or brace
-    scan. Used only when the strict prompt failed to elicit clean JSON."""
+    """Deep last-resort: extract the first valid JSON object from chat-style
+    text. A fenced block is tried first; then a string-aware scan using
+    json.JSONDecoder().raw_decode at every `{` — naive brace counting would
+    miscount braces inside string values, and these payloads carry code."""
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    depth = 0
-    start = None
-    for i, c in enumerate(text):
-        if c == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    start = None
-                    depth = 0
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, _end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = text.find("{", idx + 1)
     raise RuntimeError(
         f"no JSON object extractable from chat text; first 500 chars: {text[:500]}"
     )
@@ -171,24 +147,14 @@ def _flatten_prompt(system_message: Any, user_message: Any) -> str:
 
 
 def _call_claude_cli(
-    system_message: Any, user_message: Any, extra_args: list[str] | None = None
+    system_message: Any,
+    user_message: Any,
+    extra_args: list[str] | None = None,
+    model: str | None = None,
 ) -> str:
     """Plain text out — used when no function-calling is requested."""
-    args = ["claude", "-p", *(extra_args or [])]
     stdin = _flatten_prompt(system_message, user_message)
-    result = subprocess.run(
-        args,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    _maybe_log_call("plain", stdin, result.stdout, result.stderr, result.returncode, args)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p failed (rc={result.returncode}): {result.stderr.strip()}"
-        )
-    return result.stdout.strip()
+    return run_claude(stdin, kind="plain", model=model, extra_args=extra_args)
 
 
 # ─── Option 2 strict-output prompt header ──────────────────────────────────
@@ -233,6 +199,7 @@ def _call_claude_cli_structured(
     user_message: Any,
     func_spec: FunctionSpec,
     extra_args: list[str] | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Structured output via strict-prompt (Option 2). Calls `claude -p` with
     no `--json-schema` flag and parses stdout directly. Falls back to a
@@ -250,23 +217,7 @@ def _call_claude_cli_structured(
     body = _flatten_prompt(system_message, user_message)
     stdin = STRICT_RULES + schema_line + schema_str + "\n\n---\n\n" + body
 
-    args = ["claude", "-p", *(extra_args or [])]
-    result = subprocess.run(
-        args,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    _maybe_log_call("structured-strict", stdin, result.stdout, result.stderr, result.returncode, args)
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p (strict) failed (rc={result.returncode}): "
-            f"{result.stderr.strip()[:500]}"
-        )
-
-    raw = result.stdout.strip()
+    raw = run_claude(stdin, kind="structured-strict", model=model, extra_args=extra_args)
 
     # Try direct parse
     try:
@@ -301,6 +252,24 @@ def query(
 ) -> tuple[OutputType, float, int, int, dict]:
     t0 = time.time()
 
+    model = model_kwargs.get("model")
+
+    # `claude -p` exposes no temperature/max_tokens control — the only lever
+    # is the model alias (claude-cli:sonnet etc.). Say so once instead of
+    # silently swallowing the config knobs.
+    global _WARNED_IGNORED_KWARGS
+    ignored = {
+        k for k in ("temperature", "temp", "max_tokens")
+        if model_kwargs.get(k) is not None
+    }
+    if ignored and not _WARNED_IGNORED_KWARGS:
+        logger.warning(
+            f"claude-cli backend ignores model kwargs {sorted(ignored)} — "
+            "`claude -p` has no temperature/max_tokens flags; pin a model "
+            "alias (e.g. claude-cli:sonnet) for the only available control"
+        )
+        _WARNED_IGNORED_KWARGS = True
+
     # Vision support: pull image blocks out of multi-modal messages, write
     # them to disk, and instruct claude -p to Read them.
     system_message, sys_imgs = _extract_images(system_message)
@@ -320,10 +289,12 @@ def query(
             extra_args += ["--add-dir", d]
 
     if func_spec is None:
-        output: OutputType = _call_claude_cli(system_message, user_message, extra_args)
+        output: OutputType = _call_claude_cli(
+            system_message, user_message, extra_args, model=model
+        )
     else:
         output = _call_claude_cli_structured(
-            system_message, user_message, func_spec, extra_args
+            system_message, user_message, func_spec, extra_args, model=model
         )
     req_time = time.time() - t0
 
@@ -334,5 +305,7 @@ def query(
         else len(json.dumps(output)) // 4
     )
 
-    info = {"stop_reason": "end_turn"}
+    # len//4 guesses, not API-reported usage — tagged so token_tracker.json
+    # is never mistaken for billable numbers.
+    info = {"stop_reason": "end_turn", "token_counts_estimated": True}
     return output, req_time, in_tokens, out_tokens, info

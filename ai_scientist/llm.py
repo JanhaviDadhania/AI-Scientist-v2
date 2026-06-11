@@ -1,9 +1,9 @@
 import json
 import os
 import re
-import subprocess
 from typing import Any
 from ai_scientist.utils.token_tracker import track_token_usage
+from ai_scientist.claude_cli_util import is_claude_cli, run_claude
 
 import anthropic
 import backoff
@@ -24,37 +24,14 @@ class _ClaudeCLIClient:
 CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
 
 
-_LLM_LOG_SEQ = 0
-
-
-def _maybe_log_llm_call(stdin: str, stdout: str, stderr: str, returncode: int) -> None:
-    """If CLAUDE_CALL_LOG_DIR is set, persist this call's IO to disk.
-    PATCHED 2026-06-08: nothing the paid LLM produces should be lost."""
-    import os, time, uuid
-    log_dir = os.environ.get("CLAUDE_CALL_LOG_DIR")
-    if not log_dir:
-        return
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        global _LLM_LOG_SEQ
-        _LLM_LOG_SEQ += 1
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        tag = f"{ts}_pid{os.getpid()}_seq{_LLM_LOG_SEQ:05d}_writeup_{uuid.uuid4().hex[:6]}"
-        with open(os.path.join(log_dir, f"{tag}_input.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# kind: writeup-plain\n# returncode: {returncode}\n---\n")
-            f.write(stdin)
-        with open(os.path.join(log_dir, f"{tag}_output.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# returncode: {returncode}\n# stderr:\n{stderr}\n---stdout---\n")
-            f.write(stdout)
-    except Exception:
-        pass  # logging must never crash the run
-
-
-def _call_claude_cli(system_message: str, msg_history: list[dict[str, Any]]) -> str:
+def _call_claude_cli(
+    system_message: str, msg_history: list[dict[str, Any]], model: str | None = None
+) -> str:
     """Run the local `claude -p` CLI and return its stdout as the assistant reply.
 
     msg_history is a list of {"role", "content"} dicts. We flatten it into a
     single prompt because `claude -p` is a one-shot non-interactive call.
+    Timeout/retries/logging live in claude_cli_util.run_claude.
     """
     parts: list[str] = []
     if system_message:
@@ -70,20 +47,7 @@ def _call_claude_cli(system_message: str, msg_history: list[dict[str, Any]]) -> 
         parts.append(f"[{role}]\n{content}\n")
     parts.append("[ASSISTANT]\n")
     prompt = "\n".join(parts)
-
-    result = subprocess.run(
-        ["claude", "-p"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    _maybe_log_llm_call(prompt, result.stdout, result.stderr, result.returncode)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p failed (rc={result.returncode}): {result.stderr.strip()}"
-        )
-    return result.stdout.strip()
+    return run_claude(prompt, kind="writeup-plain", model=model)
 
 
 AVAILABLE_LLMS = [
@@ -176,11 +140,11 @@ def get_batch_responses_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         content = []
         for _ in range(n_responses):
-            c = _call_claude_cli(system_message, new_msg_history)
+            c = _call_claude_cli(system_message, new_msg_history, model=model)
             content.append(c)
         new_msg_history = [
             new_msg_history + [{"role": "assistant", "content": c}] for c in content
@@ -364,9 +328,9 @@ def get_response_from_llm(
     if msg_history is None:
         msg_history = []
 
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        content = _call_claude_cli(system_message, new_msg_history)
+        content = _call_claude_cli(system_message, new_msg_history, model=model)
         new_msg_history = new_msg_history + [
             {"role": "assistant", "content": content}
         ]
@@ -571,7 +535,7 @@ def extract_json_between_markers(llm_output: str) -> dict | None:
 
 
 def create_client(model) -> tuple[Any, str]:
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         print(f"Using local Claude CLI (`claude -p`) for model {model}.")
         return _ClaudeCLIClient(), model
     if model.startswith("claude-"):

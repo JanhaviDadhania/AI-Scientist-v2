@@ -1,5 +1,6 @@
 from . import backend_anthropic, backend_openai, backend_claude_cli
 from .backend_claude_cli import CLAUDE_CLI_MODEL_NAMES
+from ...claude_cli_util import is_claude_cli
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 
 def get_ai_client(model: str, **model_kwargs):
@@ -12,7 +13,7 @@ def get_ai_client(model: str, **model_kwargs):
     Returns:
         An instance of the appropriate AI client.
     """
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         return None  # claude-cli backend uses subprocess, no client object
     if "claude-" in model:
         return backend_anthropic.get_ai_client(model=model, **model_kwargs)
@@ -69,7 +70,7 @@ def query(
     else:
         model_kwargs["max_tokens"] = max_tokens
 
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         query_func = backend_claude_cli.query
     elif "claude-" in model:
         query_func = backend_anthropic.query

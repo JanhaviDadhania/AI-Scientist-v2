@@ -23,7 +23,7 @@ exec:
 generate_report: True
 # LLM settings for final report from journal
 report:
-  model: claude-cli
+  model: claude-cli:sonnet
   temp: 1.0
 
 experiment:
@@ -54,7 +54,7 @@ agent:
 
   # LLM settings for coding
   code:
-    model: claude-cli
+    model: claude-cli:sonnet
     temp: 1.0
     max_tokens: 12000
 
@@ -63,14 +63,14 @@ agent:
   # the JSON schema is embedded in the prompt and the reply is parsed
   # from stdout with json.loads (no --json-schema flag).
   feedback:
-    model: claude-cli
+    model: claude-cli:sonnet
     temp: 0.5
     max_tokens: 8192
 
   # Vision feedback on plots. claude-cli is multimodal: the backend writes
   # image blocks to disk and `claude -p` Reads the files itself.
   vlm_feedback:
-    model: claude-cli
+    model: claude-cli:sonnet
     temp: 0.5
     max_tokens: null
 
@@ -81,9 +81,9 @@ agent:
 
   # Options for summarizing findings and selecting the best node.
   summary:
-    model: claude-cli
+    model: claude-cli:sonnet
     temp: 0.3
 
   select_node:
-    model: claude-cli
+    model: claude-cli:sonnet
     temp: 0.3
