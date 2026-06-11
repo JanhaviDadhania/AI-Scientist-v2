@@ -2,12 +2,12 @@ import base64
 from typing import Any
 import re
 import json
-import subprocess
 import backoff
 import openai
 import os
 from PIL import Image
 from ai_scientist.utils.token_tracker import track_token_usage
+from ai_scientist.claude_cli_util import is_claude_cli, run_claude
 
 MAX_NUM_TOKENS = 4096
 
@@ -24,39 +24,13 @@ class _ClaudeCLIClient:
 
 CLAUDE_CLI_MODEL_NAMES = {"claude-cli", "claude-code"}
 
-_VLM_LOG_SEQ = 0
-
-
-def _maybe_log_vlm_call(stdin: str, stdout: str, stderr: str, returncode: int) -> None:
-    """If CLAUDE_CALL_LOG_DIR is set, persist this call's IO to disk.
-    Nothing the paid LLM produces should be lost."""
-    import time, uuid
-
-    log_dir = os.environ.get("CLAUDE_CALL_LOG_DIR")
-    if not log_dir:
-        return
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        global _VLM_LOG_SEQ
-        _VLM_LOG_SEQ += 1
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        tag = f"{ts}_pid{os.getpid()}_seq{_VLM_LOG_SEQ:05d}_vlm_{uuid.uuid4().hex[:6]}"
-        with open(os.path.join(log_dir, f"{tag}_input.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# kind: vlm-vision\n# returncode: {returncode}\n---\n")
-            f.write(stdin)
-        with open(os.path.join(log_dir, f"{tag}_output.txt"), "w", encoding="utf-8") as f:
-            f.write(f"# returncode: {returncode}\n# stderr:\n{stderr}\n---stdout---\n")
-            f.write(stdout)
-    except Exception:
-        pass  # logging must never crash the run
-
 
 def _call_claude_cli_vlm(
     system_message: str,
     msg: str,
     image_paths: str | list[str],
     msg_history: list[dict[str, Any]],
-    timeout: int = 900,
+    model: str | None = None,
 ) -> str:
     """One-shot `claude -p` call with image files referenced by path."""
     if isinstance(image_paths, str):
@@ -90,19 +64,7 @@ def _call_claude_cli_vlm(
     for d in sorted({os.path.dirname(os.path.abspath(p)) for p in image_paths}):
         add_dir_args += ["--add-dir", d]
 
-    result = subprocess.run(
-        ["claude", "-p", *add_dir_args],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    _maybe_log_vlm_call(prompt, result.stdout, result.stderr, result.returncode)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p (vlm) failed (rc={result.returncode}): {result.stderr.strip()}"
-        )
-    return result.stdout.strip()
+    return run_claude(prompt, kind="vlm-vision", model=model, extra_args=add_dir_args)
 
 
 AVAILABLE_VLMS = [
@@ -245,11 +207,13 @@ def get_response_from_vlm(
     if msg_history is None:
         msg_history = []
 
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         # Local Claude Code CLI path: image paths travel in the prompt; claude
         # reads the files itself. Must run BEFORE the generic AVAILABLE_VLMS
         # branch, which base64-encodes for API-style clients.
-        content = _call_claude_cli_vlm(system_message, msg, image_paths, msg_history)
+        content = _call_claude_cli_vlm(
+            system_message, msg, image_paths, msg_history, model=model
+        )
         new_msg_history = msg_history + [
             {"role": "user", "content": msg},
             {"role": "assistant", "content": content},
@@ -306,7 +270,7 @@ def get_response_from_vlm(
 
 def create_client(model: str) -> tuple[Any, str]:
     """Create client for vision-language model."""
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         print(f"Using local Claude CLI (`claude -p`) as VLM for model {model}.")
         return _ClaudeCLIClient(), model
     if model in [
@@ -403,11 +367,13 @@ def get_batch_responses_from_vlm(
     if msg_history is None:
         msg_history = []
 
-    if model in CLAUDE_CLI_MODEL_NAMES:
+    if is_claude_cli(model):
         contents: list[str] = []
         histories: list[list[dict[str, Any]]] = []
         for _ in range(n_responses):
-            c = _call_claude_cli_vlm(system_message, msg, image_paths, msg_history)
+            c = _call_claude_cli_vlm(
+                system_message, msg, image_paths, msg_history, model=model
+            )
             contents.append(c)
             histories.append(
                 msg_history

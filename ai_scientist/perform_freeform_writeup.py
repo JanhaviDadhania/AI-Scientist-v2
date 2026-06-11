@@ -23,7 +23,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -329,19 +328,13 @@ def build_prompt(
 # ---------- Driver ----------
 
 
-def _call_claude(prompt: str, system: str, timeout: int = 1200) -> str:
-    """Call `claude -p` with the assembled prompt. Returns stdout."""
+def _call_claude(prompt: str, system: str) -> str:
+    """Call `claude -p` with the assembled prompt via the shared util
+    (timeout/retries/logging in ai_scientist.claude_cli_util)."""
+    from ai_scientist.claude_cli_util import run_claude
+
     full = f"[SYSTEM]\n{system}\n\n[USER]\n{prompt}\n\n[ASSISTANT]\n"
-    result = subprocess.run(
-        ["claude", "-p"],
-        input=full,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude -p failed ({result.returncode}): {result.stderr.strip()}")
-    return result.stdout
+    return run_claude(full, kind="freeform-writeup")
 
 
 def perform_freeform_writeup(
