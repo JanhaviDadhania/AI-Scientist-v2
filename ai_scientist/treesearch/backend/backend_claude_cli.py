@@ -21,11 +21,13 @@ PATCHED 2026-06-09 (Option 2 — strict-prompt structured output):
     Nothing the paid LLM produces should be lost.
 """
 
+import base64
 import json
 import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -90,6 +92,63 @@ def _extract_json_from_chat(text: str) -> dict:
     )
 
 
+def _extract_images(message: Any) -> tuple[Any, list[str]]:
+    """Split an OpenAI-style multi-modal content-block list into plain text
+    plus image file paths.
+
+    compile_prompt_to_md (backend/utils.py) passes lists where every item is a
+    dict with a "type" key through UNCHANGED — that is how vision messages
+    (e.g. _analyze_plots_with_vlm's text + base64 image_url blocks) reach this
+    backend. `claude -p` is multimodal but reads images from DISK via its Read
+    tool, so base64 data-URLs are decoded back to image files in a temp dir.
+    Any other message shape is returned unchanged with no images.
+    """
+    if not (
+        isinstance(message, list)
+        and message
+        and all(isinstance(b, dict) and "type" in b for b in message)
+    ):
+        return message, []
+    texts: list[str] = []
+    paths: list[str] = []
+    img_dir = None
+    for block in message:
+        btype = block.get("type")
+        if btype == "text":
+            texts.append(block.get("text", ""))
+        elif btype == "image_url":
+            url = (block.get("image_url") or {}).get("url", "")
+            m = re.match(r"data:image/(\w+);base64,(.+)", url, re.DOTALL)
+            if m:
+                ext = m.group(1) if m.group(1) in ("png", "jpeg", "jpg", "webp", "gif") else "png"
+                if img_dir is None:
+                    img_dir = tempfile.mkdtemp(prefix="claude_cli_imgs_")
+                path = os.path.join(img_dir, f"img_{len(paths):02d}.{ext}")
+                try:
+                    with open(path, "wb") as f:
+                        f.write(base64.b64decode(m.group(2)))
+                    paths.append(path)
+                except Exception as e:
+                    logger.warning(f"failed to decode image block to disk: {e}")
+            elif url:
+                texts.append(f"(image available at URL: {url})")
+        else:
+            texts.append(str(block))
+    return "\n".join(t for t in texts if t), paths
+
+
+def _image_instructions(paths: list[str]) -> str:
+    listing = "\n".join(f"- {p}" for p in paths)
+    return (
+        "\n[IMAGES]\n"
+        "The following image files are part of this request. Use your Read tool "
+        "to view EVERY one of them before answering. Base your analysis only on "
+        "what you actually see in the images; never invent plot contents. Refer "
+        "to the images in the order listed.\n"
+        f"{listing}\n"
+    )
+
+
 def _flatten_prompt(system_message: Any, user_message: Any) -> str:
     parts: list[str] = []
     if isinstance(system_message, dict):
@@ -111,9 +170,11 @@ def _flatten_prompt(system_message: Any, user_message: Any) -> str:
     return "\n".join(parts)
 
 
-def _call_claude_cli(system_message: Any, user_message: Any) -> str:
+def _call_claude_cli(
+    system_message: Any, user_message: Any, extra_args: list[str] | None = None
+) -> str:
     """Plain text out — used when no function-calling is requested."""
-    args = ["claude", "-p"]
+    args = ["claude", "-p", *(extra_args or [])]
     stdin = _flatten_prompt(system_message, user_message)
     result = subprocess.run(
         args,
@@ -171,6 +232,7 @@ def _call_claude_cli_structured(
     system_message: Any,
     user_message: Any,
     func_spec: FunctionSpec,
+    extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
     """Structured output via strict-prompt (Option 2). Calls `claude -p` with
     no `--json-schema` flag and parses stdout directly. Falls back to a
@@ -188,7 +250,7 @@ def _call_claude_cli_structured(
     body = _flatten_prompt(system_message, user_message)
     stdin = STRICT_RULES + schema_line + schema_str + "\n\n---\n\n" + body
 
-    args = ["claude", "-p"]
+    args = ["claude", "-p", *(extra_args or [])]
     result = subprocess.run(
         args,
         input=stdin,
@@ -238,10 +300,31 @@ def query(
     **model_kwargs: Any,
 ) -> tuple[OutputType, float, int, int, dict]:
     t0 = time.time()
+
+    # Vision support: pull image blocks out of multi-modal messages, write
+    # them to disk, and instruct claude -p to Read them.
+    system_message, sys_imgs = _extract_images(system_message)
+    user_message, usr_imgs = _extract_images(user_message)
+    image_paths = sys_imgs + usr_imgs
+    extra_args: list[str] = []
+    if image_paths:
+        instr = _image_instructions(image_paths)
+        if isinstance(user_message, str) or user_message is None:
+            user_message = f"{user_message}\n{instr}" if user_message else instr
+        else:  # dict-style prompt: add as its own section
+            user_message = dict(user_message)
+            user_message["Images"] = instr
+        # Non-interactive `claude -p` can only Read files inside its working
+        # directories; grant the image dirs explicitly via --add-dir.
+        for d in sorted({os.path.dirname(os.path.abspath(p)) for p in image_paths}):
+            extra_args += ["--add-dir", d]
+
     if func_spec is None:
-        output: OutputType = _call_claude_cli(system_message, user_message)
+        output: OutputType = _call_claude_cli(system_message, user_message, extra_args)
     else:
-        output = _call_claude_cli_structured(system_message, user_message, func_spec)
+        output = _call_claude_cli_structured(
+            system_message, user_message, func_spec, extra_args
+        )
     req_time = time.time() - t0
 
     in_tokens = (len(str(system_message) if system_message else "") + len(str(user_message) if user_message else "")) // 4

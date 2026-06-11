@@ -954,6 +954,8 @@ def perform_writeup(
                 f.write(content)
 
         # Generate VLM-based descriptions
+        vlm_client = None
+        vlm_model = None
         try:
             vlm_client, vlm_model = create_vlm_client(small_model)
             desc_map = {}
@@ -1036,14 +1038,20 @@ def perform_writeup(
             print(f"[green]Compiling PDF for reflection {i+1}...[/green]")
             compile_latex(latex_folder, reflection_pdf)
 
-            review_img_cap_ref = perform_imgs_cap_ref_review(
-                vlm_client, vlm_model, reflection_pdf
-            )
+            # Guard: if the VLM client could not be created, degrade to
+            # text-only reflection instead of dying on an unbound variable.
+            if vlm_client is not None:
+                review_img_cap_ref = perform_imgs_cap_ref_review(
+                    vlm_client, vlm_model, reflection_pdf
+                )
 
-            # Detect duplicate figures between main text and appendix
-            analysis_duplicate_figs = detect_duplicate_figures(
-                vlm_client, vlm_model, reflection_pdf
-            )
+                # Detect duplicate figures between main text and appendix
+                analysis_duplicate_figs = detect_duplicate_figures(
+                    vlm_client, vlm_model, reflection_pdf
+                )
+            else:
+                review_img_cap_ref = "(VLM unavailable — no image/caption review this round)"
+                analysis_duplicate_figs = "(VLM unavailable — duplicate-figure check skipped)"
             print(analysis_duplicate_figs)
 
             # Get reflection_page_info
@@ -1125,9 +1133,12 @@ Ensure proper citation usage:
                 break
             # Get new reflection_page_info
             reflection_page_info = get_reflection_page_info(reflection_pdf, page_limit)
-            review_img_selection = perform_imgs_cap_ref_review_selection(
-                vlm_client, vlm_model, reflection_pdf, reflection_page_info
-            )
+            if vlm_client is not None:
+                review_img_selection = perform_imgs_cap_ref_review_selection(
+                    vlm_client, vlm_model, reflection_pdf, reflection_page_info
+                )
+            else:
+                review_img_selection = "(VLM unavailable — figure-selection review skipped)"
             img_reflection_prompt = f"""Now let's reflect on
 The following figures are currently used in the paper: {sorted(used_figs)}
 The following figures are available in the folder but not used in the LaTeX: {sorted(unused_figs)}

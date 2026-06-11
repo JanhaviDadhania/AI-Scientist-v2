@@ -85,19 +85,19 @@ def parse_arguments():
     parser.add_argument(
         "--model_agg_plots",
         type=str,
-        default="o3-mini-2025-01-31",
+        default="claude-cli",
         help="Model to use for plot aggregation",
     )
     parser.add_argument(
         "--model_writeup",
         type=str,
-        default="o1-preview-2024-09-12",
+        default="claude-cli",
         help="Model to use for writeup",
     )
     parser.add_argument(
         "--model_citation",
         type=str,
-        default="gpt-4o-2024-11-20",
+        default="claude-cli",
         help="Model to use for citation gathering",
     )
     parser.add_argument(
@@ -109,13 +109,13 @@ def parse_arguments():
     parser.add_argument(
         "--model_writeup_small",
         type=str,
-        default="gpt-4o-2024-05-13",
+        default="claude-cli",
         help="Smaller model to use for writeup",
     )
     parser.add_argument(
         "--model_review",
         type=str,
-        default="gpt-4o-2024-11-20",
+        default="claude-cli",
         help="Model to use for review main text and captions",
     )
     parser.add_argument(
@@ -140,6 +140,29 @@ def get_available_gpus(gpu_ids=None):
 def find_pdf_path_for_review(idea_dir):
     pdf_files = [f for f in os.listdir(idea_dir) if f.endswith(".pdf")]
     reflection_pdfs = [f for f in pdf_files if "reflection" in f]
+    if not reflection_pdfs:
+        # This branch should never be reached in a healthy run: no reflection
+        # PDFs means the writeup reflection loop never completed even once
+        # (or pdflatex never produced a PDF at all). Survive, but say so
+        # loudly — the real problem is upstream in the writeup stage.
+        if pdf_files:
+            fallback = max(
+                (osp.join(idea_dir, f) for f in pdf_files), key=osp.getmtime
+            )
+            print(
+                "WARNING [find_pdf_path_for_review]: no reflection PDFs found in "
+                f"{idea_dir} — the writeup reflection loop never completed. "
+                f"Falling back to the most recent PDF ({osp.basename(fallback)}), "
+                "which is likely the UNREFLECTED first draft. Investigate the "
+                "writeup stage logs."
+            )
+            return fallback
+        print(
+            "WARNING [find_pdf_path_for_review]: no PDF of any kind found in "
+            f"{idea_dir} — writeup failed or pdflatex is unavailable. "
+            "Nothing to review."
+        )
+        return None
     if reflection_pdfs:
         # First check if there's a final version
         final_pdfs = [f for f in reflection_pdfs if "final" in f.lower()]
@@ -304,7 +327,13 @@ if __name__ == "__main__":
     if not args.skip_review and not args.skip_writeup:
         # Perform paper review if the paper exists
         pdf_path = find_pdf_path_for_review(idea_dir)
-        if os.path.exists(pdf_path):
+        if pdf_path is None or not os.path.exists(pdf_path):
+            print(
+                "WARNING: skipping the review stage — no reviewable PDF. "
+                "This is NOT a clean skip: it means the writeup stage did not "
+                "produce what it should have. Check the writeup logs above."
+            )
+        else:
             print("Paper found at: ", pdf_path)
             paper_content = load_paper(pdf_path)
             client, client_model = create_client(args.model_review)
@@ -344,19 +373,11 @@ if __name__ == "__main__":
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    # Additional cleanup: find any orphaned processes containing specific keywords
-    keywords = ["python", "torch", "mp", "bfts", "experiment"]
-    for proc in psutil.process_iter(["name", "cmdline"]):
-        try:
-            # Check both process name and command line arguments
-            cmdline = " ".join(proc.cmdline()).lower()
-            if any(keyword in cmdline for keyword in keywords):
-                proc.send_signal(signal.SIGTERM)
-                proc.wait(timeout=3)
-                if proc.is_running():
-                    proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-            continue
+    # Cleanup is intentionally limited to children of this process. The
+    # upstream keyword sweep (SIGTERM to ANY process on the machine whose
+    # cmdline contained "python"/"torch"/"mp"/"bfts"/"experiment") was written
+    # for disposable cloud boxes; on a shared laptop it kills unrelated work,
+    # including concurrent co-scientist runs and this launcher itself.
 
     # Finally, terminate the current process
     # current_process.send_signal(signal.SIGTERM)
